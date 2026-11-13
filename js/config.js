@@ -6,13 +6,13 @@ window.SURVEY_CONFIG = {
   // Paste the "Web app URL" you get when you deploy backend/Code.gs (see LAUNCH.md), e.g.
   // "https://script.google.com/macros/s/AKfycb.../exec"
   // Leave empty when running locally with `npm run local` (it then uses /api automatically).
-  backendUrl: "",
+  backendUrl: "https://script.google.com/macros/s/AKfycbxy6afiYGnJRy6Y9mjSjcDmL5p7WCs-g5Z_Eok4JMSpRxhJPetFzAcXGQkvDEEtZ8r1_A/exec",
 
   // ── Study texts ────────────────────────────────────────────────────────────
   studyTitle: "Learning from an AI assistant",
   estimatedMinutes: 30,
-  contactName: "Leander Stierman",
-  contactEmail: "", // TODO before launch: shown on the consent and thank-you pages
+  contactName: "",
+  contactEmail: "",
   institution: "Ghent University — AI Research Seminar 2026",
 
   // ── Media ──────────────────────────────────────────────────────────────────
