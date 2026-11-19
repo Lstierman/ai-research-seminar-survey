@@ -153,9 +153,20 @@
     if (!raw) return;
     var d = prepared();
     $("meta").textContent = "Data loaded " + new Date(raw.serverTime).toLocaleString() + " · showing " + d.parts.length + " participants" +
-      ($("opt-test").checked ? " (incl. test)" : "") + ($("opt-class").checked ? " (incl. class group)" : "") + ($("opt-unfinished").checked ? " (incl. unfinished)" : "") + " · " + d.answers.length + " answers" + hiddenNote(d);
+      ($("opt-test").checked ? " (incl. test)" : "") + ($("opt-class").checked ? " (incl. class group)" : "") + ($("opt-unfinished").checked ? " (incl. unfinished)" : "") + " · " + d.answers.length + " answers" + hiddenNote(d) + queueNote();
     Array.prototype.forEach.call(document.querySelectorAll(".active-hours"), function (el) { el.textContent = raw.activeHours; });
     renderKpis(d); renderBalance(d); renderMain(d); renderCertainty(d); renderTopics(d); renderExposure(d); renderExtra(d); renderParticipants(d);
+  }
+
+  // Backend v1.1+ queues saves and writes them to the Sheet every minute.
+  function queueNote() {
+    var q = raw.queue;
+    if (!q) return "";
+    var out = "";
+    if (q.waiting) out += " · " + q.waiting + " save" + (q.waiting > 1 ? "s" : "") + " waiting in the queue" +
+      (q.oldestSeconds > 180 ? " (\u26a0 oldest " + Math.round(q.oldestSeconds / 60) + " min — is the drainQueue trigger installed? Run setup() in Apps Script)" : "");
+    if (q.dead && q.dead.length) out += " · \u26a0 " + q.dead.length + " save" + (q.dead.length > 1 ? "s" : "") + " refused — run queueStatus() in Apps Script";
+    return out;
   }
 
   // Participants whose last "finish" call never arrived are hidden by default, together with all their saved topics.
