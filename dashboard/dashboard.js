@@ -115,9 +115,10 @@
   $("refresh").addEventListener("click", load);
   $("logout").addEventListener("click", function () { setKey(null); showLogin(); });
   $("opt-test").addEventListener("change", render);
+  $("opt-class").addEventListener("change", render);
   $("opt-unfinished").addEventListener("change", render);
   $("purge").addEventListener("click", function () {
-    if (!confirm("Delete ALL test participants (started with ?test=1) and their answers from the Sheet?")) return;
+    if (!confirm("Delete ALL test participants (started with ?test=1 or via /class/) and their answers from the Sheet?")) return;
     fetch(apiUrl(), { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify({ action: "purgeTest", key: getKey() }) })
       .then(function (r) { return r.json(); })
       .then(function (d) { if (d.error) throw new Error(d.error); alert("Deleted " + d.deletedParticipants + " test participants."); load(); })
@@ -126,12 +127,13 @@
 
   // ─── data prep ──────────────────────────────────────────────────────────
   function prepared() {
-    var incTest = $("opt-test").checked, incUnf = $("opt-unfinished").checked;
+    var incTest = $("opt-test").checked, incClass = $("opt-class").checked, incUnf = $("opt-unfinished").checked;
     var parts = raw.participants.map(function (p) {
-      return Object.assign({}, p, { test: truthy(p.test), completed: p.status === "completed" });
+      var cls = String(p.group || "") === "class";
+      return Object.assign({}, p, { cls: cls, test: cls || truthy(p.test), completed: p.status === "completed" });
     });
     var keep = {};
-    parts.forEach(function (p) { if ((incTest || !p.test) && (incUnf || p.completed)) keep[p.participant_id] = true; });
+    parts.forEach(function (p) { if (showGroup(p, incTest, incClass) && (incUnf || p.completed)) keep[p.participant_id] = true; });
     var answers = raw.answers.filter(function (a) { return keep[a.participant_id]; }).map(function (a) {
       return Object.assign({}, a, {
         position: num(a.position), is_correct: num(a.is_correct), chose_error_answer: num(a.chose_error_answer),
@@ -143,14 +145,27 @@
     return { all: parts, parts: parts.filter(function (p) { return keep[p.participant_id]; }), answers: answers, extra: extra };
   }
 
+  // Real participants always; class-group runs only with "Include class group"; other test runs with "Include test data".
+  function showGroup(p, incTest, incClass) { return p.cls ? incClass : p.test ? incTest : true; }
+
   // ─── rendering ──────────────────────────────────────────────────────────
   function render() {
     if (!raw) return;
     var d = prepared();
     $("meta").textContent = "Data loaded " + new Date(raw.serverTime).toLocaleString() + " · showing " + d.parts.length + " participants" +
-      ($("opt-test").checked ? " (incl. test)" : "") + ($("opt-unfinished").checked ? " (incl. unfinished)" : "") + " · " + d.answers.length + " answers";
+      ($("opt-test").checked ? " (incl. test)" : "") + ($("opt-class").checked ? " (incl. class group)" : "") + ($("opt-unfinished").checked ? " (incl. unfinished)" : "") + " · " + d.answers.length + " answers" + hiddenNote(d);
     Array.prototype.forEach.call(document.querySelectorAll(".active-hours"), function (el) { el.textContent = raw.activeHours; });
     renderKpis(d); renderBalance(d); renderMain(d); renderCertainty(d); renderTopics(d); renderExposure(d); renderExtra(d); renderParticipants(d);
+  }
+
+  // Participants whose last "finish" call never arrived are hidden by default, together with all their saved topics.
+  function hiddenNote(d) {
+    if ($("opt-unfinished").checked) return "";
+    var hidden = d.all.filter(function (p) { return !p.completed && showGroup(p, $("opt-test").checked, $("opt-class").checked); });
+    if (!hidden.length) return "";
+    var ids = {}; hidden.forEach(function (p) { ids[p.participant_id] = true; });
+    var n = raw.answers.filter(function (a) { return ids[a.participant_id]; }).length;
+    return " · \u26a0 " + hidden.length + " unfinished participant" + (hidden.length > 1 ? "s" : "") + " with " + n + " saved answers hidden (tick \u201cInclude unfinished participants\u201d)";
   }
 
   function renderKpis(d) {
@@ -392,12 +407,12 @@
   function renderParticipants(d) {
     var byP = {};
     d.answers.forEach(function (a) { (byP[a.participant_id] = byP[a.participant_id] || []).push(a); });
-    var rows = d.all.filter(function (p) { return ($("opt-test").checked || !p.test); }).sort(function (a, b) { return String(b.started_at).localeCompare(String(a.started_at)); });
+    var rows = d.all.filter(function (p) { return showGroup(p, $("opt-test").checked, $("opt-class").checked); }).sort(function (a, b) { return String(b.started_at).localeCompare(String(a.started_at)); });
     $("participants").innerHTML = "<table><tr><th>Participant</th><th>Condition</th><th>Status</th><th>Started</th><th class='num'>Topics saved</th><th class='num'>Correct</th><th class='num'>Errors adopted</th><th class='num'>Minutes</th><th>Device</th><th>Comments</th></tr>" +
       rows.map(function (p) {
         var A = byP[p.participant_id] || [];
         var adopted = A.filter(function (a) { return a.adopted_error === 1; }).length, targets = A.filter(function (a) { return a.adopted_error != null; }).length;
-        return "<tr><td><code>" + esc(p.participant_id) + "</code>" + (p.test ? " <span class='muted small'>test</span>" : "") + "</td><td data-tip='" + esc(String(p.topic_order).split(" | ").join("\n")) + "'>" + esc(p.condition) +
+        return "<tr><td><code>" + esc(p.participant_id) + "</code>" + (p.cls ? " <span class='muted small'>class</span>" : p.test ? " <span class='muted small'>test</span>" : "") + "</td><td data-tip='" + esc(String(p.topic_order).split(" | ").join("\n")) + "'>" + esc(p.condition) +
           "</td><td>" + esc(p.status) + "</td><td>" + esc(new Date(p.started_at).toLocaleString()) + "</td><td class='num'>" + esc(p.last_position) + " / 6</td><td class='num'>" +
           (A.length ? A.filter(function (a) { return a.is_correct === 1; }).length + " / " + A.length : "–") + "</td><td class='num'>" + (targets ? adopted + " / " + targets : "–") +
           "</td><td class='num'>" + esc(p.total_minutes) + "</td><td>" + esc(p.device) + "</td><td style='white-space:normal;min-width:200px'>" + esc(p.comments) + "</td></tr>";

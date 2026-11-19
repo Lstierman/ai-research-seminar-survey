@@ -4,6 +4,8 @@
  *   → final questions → thank-you and debrief
  *
  * URL options:
+ *   /class/     class / test group: separate entry page, needs the class login ID (?id=… or asked once),
+ *               saved as test data with group "class" (not counted for the balancing).
  *   ?test=1     real backend, but marked as test (not counted for the balancing; deletable from the dashboard).
  *               On the live site this needs the dashboard key in this browser (log in to the dashboard first).
  *   ?preview=1  no backend at all, nothing is saved (random condition). Only on `npm run local`.
@@ -26,11 +28,24 @@
   var DASHBOARD_KEY = (function () { try { return localStorage.getItem("aiExplanationSurvey.dashboardKey") || ""; } catch (e) { return ""; } })();
   // Preview (no backend, pick any explanation) only exists on `npm run local`; the live site ignores it.
   var PREVIEW = LOCAL && params.has("preview");
-  var TEST_REQUESTED = params.get("test") === "1";
-  var TEST = TEST_REQUESTED && (LOCAL || !!DASHBOARD_KEY);
+  // Class / test group: the page at /class/ sets <meta name="survey-group" content="class">.
+  // Those runs are saved as test data tagged group "class" (never counted for the balancing) and need
+  // the class login ID instead of the dashboard key. The ID comes from ?id=… or is asked once.
+  var groupMeta = document.querySelector('meta[name="survey-group"]');
+  var CLASS = !PREVIEW && !!(groupMeta && groupMeta.content === "class");
+  var CLASS_KEY_STORE = "aiExplanationSurvey.classKey";
+  var classKey = (function () {
+    var fromUrl = (params.get("id") || "").trim();
+    try {
+      if (fromUrl) localStorage.setItem(CLASS_KEY_STORE, fromUrl);
+      return fromUrl || localStorage.getItem(CLASS_KEY_STORE) || "";
+    } catch (e) { return fromUrl; }
+  })();
+  var TEST_REQUESTED = !CLASS && params.get("test") === "1";
+  var TEST = CLASS || (TEST_REQUESTED && (LOCAL || !!DASHBOARD_KEY));
   var localRunMeta = document.querySelector('meta[name="local-run-id"]');
   var localRunId = localRunMeta && localRunMeta.content !== "__LOCAL_RUN_ID__" ? localRunMeta.content : "";
-  var STORE_KEY = "aiExplanationSurvey.v1" + (localRunId ? ".local." + localRunId : "") + (PREVIEW ? ".preview" : TEST ? ".test" : "");
+  var STORE_KEY = "aiExplanationSurvey.v1" + (localRunId ? ".local." + localRunId : "") + (PREVIEW ? ".preview" : CLASS ? ".class" : TEST ? ".test" : "");
 
   var app = document.getElementById("app");
   var state = load() || freshState();
@@ -39,12 +54,17 @@
   function freshState() {
     return {
       screen: "welcome", pid: null, condition: null, plan: null, pos: 0, q: 0,
-      pending: null, extraIndex: 0, extra: [], startedAt: Date.now(), optionOrders: {},
+      pending: null, extraIndex: 0, extra: [], startedAt: Date.now(), optionOrders: {}, clientId: newId(),
     };
+  }
+  function newId() {
+    try { if (window.crypto && crypto.randomUUID) return crypto.randomUUID(); } catch (e) {}
+    return "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
   }
   function load() {
     try {
       var s = JSON.parse(localStorage.getItem(STORE_KEY));
+      if (s && s.screen && !s.clientId) s.clientId = newId();
       return s && s.screen ? s : null;
     } catch (e) { return null; }
   }
@@ -61,25 +81,51 @@
     return null;
   }
 
-  // POST as text/plain (no CORS preflight; works with Google Apps Script). Retries 3×.
-  function post(body) {
+  // POST as text/plain (no CORS preflight; works with Google Apps Script).
+  // The backend handles one request at a time behind a script lock, so when many people submit at
+  // once a request can wait ~30 s and then fail with a lock time-out. We therefore:
+  //   - give every attempt its own time-out (no endless spinner),
+  //   - retry up to MAX_ATTEMPTS with exponential back-off + jitter (spreads a burst out instead of
+  //     re-hitting the lock all at the same moment),
+  //   - send a stable request id ("rid") so the backend can ignore a duplicate when an earlier
+  //     attempt was saved but its reply got lost.
+  var MAX_ATTEMPTS = 6, ATTEMPT_TIMEOUT_MS = 60000;
+  function post(body, onAttempt) {
     var url = apiUrl();
     if (!url) return Promise.reject(new Error("The survey is not connected to a backend yet (backendUrl in js/config.js)."));
     var attempt = 0;
     function once() {
       attempt++;
-      return fetch(url, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify(body), redirect: "follow" })
-        .then(function (r) { return r.json(); })
+      if (onAttempt) onAttempt(attempt);
+      var ctrl = window.AbortController ? new AbortController() : null;
+      var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, ATTEMPT_TIMEOUT_MS) : null;
+      return fetch(url, {
+        method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify(body),
+        redirect: "follow", signal: ctrl ? ctrl.signal : undefined,
+      })
+        .then(function (r) {
+          return r.text().then(function (txt) {
+            try { return JSON.parse(txt); } catch (e) { throw new Error("The server is busy (HTTP " + r.status + ")"); }
+          });
+        })
         .then(function (data) {
-          if (data && data.error) { var e = new Error(data.error); e.fatal = data.status === 400 || data.status === 403; throw e; }
+          if (data && data.error) { var e = new Error(data.error); e.fatal = data.status === 400 || data.status === 403; e.status = data.status; throw e; }
           return data;
         })
         .catch(function (err) {
-          if (err.fatal || attempt >= 3) throw err;
-          return new Promise(function (res) { setTimeout(res, 800 * attempt); }).then(once);
-        });
+          if (err && err.name === "AbortError") err = new Error("The server took too long to answer");
+          if (err.fatal || attempt >= MAX_ATTEMPTS) throw err;
+          var wait = Math.min(15000, 1500 * Math.pow(2, attempt - 1)) * (0.5 + Math.random());
+          return new Promise(function (res) { setTimeout(res, wait); }).then(once);
+        })
+        .then(function (v) { if (timer) clearTimeout(timer); return v; }, function (e) { if (timer) clearTimeout(timer); throw e; });
     }
     return once();
+  }
+
+  function attemptNote(n) {
+    var el = $(".muted.status");
+    if (el && n > 1) el.textContent = "The server is busy — still trying (attempt " + n + " of " + MAX_ATTEMPTS + "). Please keep this page open.";
   }
 
   // ─── Helpers ─────────────────────────────────────────────────────────────
@@ -127,7 +173,25 @@
     (screens[state.screen] || renderWelcome)();
   }
 
+  function renderClassLogin(msg) {
+    h(
+      '<div class="card"><div class="eyebrow">Class / test group</div><h1>Enter your login ID</h1>' +
+        "<p>This version of the survey is for the class test group. Enter the login ID you received.</p>" +
+        '<form id="class-login"><input id="class-id" type="text" autocomplete="off" spellcheck="false" placeholder="login ID" style="width:100%;padding:10px;font:inherit" required />' +
+        (msg ? '<div class="notice error">' + esc(msg) + "</div>" : "") +
+        '<div class="actions"><button>Continue</button></div></form></div>'
+    );
+    $("#class-login").addEventListener("submit", function (e) {
+      e.preventDefault();
+      classKey = $("#class-id").value.trim();
+      if (!classKey) return;
+      try { localStorage.setItem(CLASS_KEY_STORE, classKey); } catch (err) {}
+      renderWelcome();
+    });
+  }
+
   function renderWelcome() {
+    if (CLASS && !classKey) return renderClassLogin();
     if (CFG.blockPhones && isPhone() && !PREVIEW) {
       return h('<div class="card"><h1>Please use a computer</h1><p>This study works best on a laptop or desktop computer with sound. Please open this link on a computer.</p></div>');
     }
@@ -155,6 +219,11 @@
       btn.disabled = true;
       btn.textContent = "Starting…";
       startParticipant().then(function () { go("sound"); }).catch(function (err) {
+        if (CLASS && err.status === 403) {
+          try { localStorage.removeItem(CLASS_KEY_STORE); } catch (e) {}
+          classKey = "";
+          return renderClassLogin("That login ID was not accepted. Please check it and try again.");
+        }
         $("#err").innerHTML = '<div class="notice error">Could not start the survey: ' + esc(err.message) + " Please try again in a moment.</div>";
         btn.disabled = false;
         btn.textContent = "Start";
@@ -176,7 +245,10 @@
       return Promise.resolve();
     }
     return post({
-      action: "start", test: TEST, key: TEST ? DASHBOARD_KEY : undefined, device: deviceType(), screen: screen.width + "x" + screen.height, ua: navigator.userAgent,
+      action: "start", rid: "start:" + state.clientId, test: TEST,
+      group: CLASS ? "class" : undefined,
+      key: CLASS ? classKey : TEST ? DASHBOARD_KEY : undefined,
+      device: deviceType(), screen: screen.width + "x" + screen.height, ua: navigator.userAgent,
     }).then(function (r) {
       state.pid = r.pid; state.condition = r.condition; state.plan = r.plan;
       save();
@@ -412,7 +484,7 @@
   }
 
   function renderSaving() {
-    h('<div class="card center"><div class="spinner"></div><p class="muted">Saving your answers…</p><div id="err"></div></div>');
+    h('<div class="card center"><div class="spinner"></div><p class="muted">Saving your answers…</p><p class="muted small status"></p><div id="err"></div></div>');
     var done = function () {
       state.pos++;
       state.q = 0;
@@ -423,17 +495,29 @@
     };
     if (PREVIEW) return setTimeout(done, 300);
     post({
-      action: "topic", pid: state.pid, position: state.pos + 1, explanationMs: state.pending.explanationMs,
+      action: "topic", rid: "topic:" + state.pid + ":" + (state.pos + 1), pid: state.pid, position: state.pos + 1, explanationMs: state.pending.explanationMs,
       plays: state.pending.plays, mediaError: state.pending.mediaError, answers: state.pending.answers,
-    }).then(done).catch(function (err) { showRetry(err, renderSaving); });
+    }, attemptNote).then(done).catch(function (err) { showRetry(err, renderSaving); });
   }
 
+  // After all automatic attempts failed: show the error, offer a button, and keep retrying on our own
+  // every 30 s so a participant who just waits still gets saved. Answers stay in localStorage.
   function showRetry(err, again) {
     var box = $("#err");
+    if (!box) return;
     $(".spinner") && ($(".spinner").style.display = "none");
-    box.innerHTML = '<div class="notice error">Your answers could not be saved (' + esc(err.message) + "). Check your internet connection and try again. Nothing is lost.</div>" +
-      '<div class="actions" style="justify-content:center"><button id="retry">Try again</button></div>';
-    $("#retry").addEventListener("click", again);
+    var left = 30;
+    box.innerHTML = '<div class="notice error">Your answers could not be saved yet (' + esc(err.message) + "). Please keep this page open — nothing is lost. " +
+      'We will try again automatically in <span id="countdown">' + left + "</span> s.</div>" +
+      '<div class="actions" style="justify-content:center"><button id="retry">Try again now</button></div>';
+    var timer = setInterval(function () {
+      var c = document.getElementById("countdown");
+      if (!c) return clearInterval(timer);
+      left--;
+      c.textContent = String(Math.max(left, 0));
+      if (left <= 0) { clearInterval(timer); again(); }
+    }, 1000);
+    $("#retry").addEventListener("click", function () { clearInterval(timer); again(); });
   }
 
   function renderExtra() {
@@ -481,6 +565,8 @@
     if (x.type === "text") $("#text").addEventListener("input", check);
     check();
     next.addEventListener("click", function () {
+      if (next.disabled) return;
+      next.disabled = true;  // a double click must not record an answer twice / skip a question
       state.extra.push({ id: x.id, prompt: x.prompt, answer: answer() || "", certainty: x.withCertainty ? Number(val("certainty")) || "" : "", ms: Date.now() - shownAt });
       if (followUp && answer() === "Yes") {
         state.extra.push({ id: followUp.id, prompt: followUp.prompt, answer: val("followup"), ms: Date.now() - shownAt });
@@ -491,9 +577,10 @@
   }
 
   function renderFinishing() {
-    h('<div class="card center"><div class="spinner"></div><p class="muted">Submitting…</p><div id="err"></div></div>');
+    h('<div class="card center"><div class="spinner"></div><p class="muted">Submitting…</p><p class="muted small status"></p><div id="err"></div></div>');
     if (PREVIEW) return setTimeout(function () { go("done"); }, 300);
-    post({ action: "finish", pid: state.pid, extra: state.extra, totalMs: Date.now() - state.startedAt })
+    if (!state.finishedAt) { state.finishedAt = Date.now(); save(); }  // retries must not inflate totalMs
+    post({ action: "finish", rid: "finish:" + state.pid, pid: state.pid, extra: state.extra, totalMs: state.finishedAt - state.startedAt }, attemptNote)
       .then(function () { go("done"); })
       .catch(function (err) { showRetry(err, renderFinishing); });
   }
@@ -527,7 +614,7 @@
         (correctTopics.length ? '<p class="small muted">These explanations were correct: ' + esc(correctTopics.join(", ")) + ".</p>" : "") +
         '<p class="small muted">Please don\'t tell others about the mistakes until the study is over, so their answers stay unbiased. You can now close this page.' +
         (CFG.contactEmail ? " Questions: " + esc(CFG.contactName) + ', <a href="mailto:' + esc(CFG.contactEmail) + '">' + esc(CFG.contactEmail) + "</a>." : "") + "</p>" +
-        (PREVIEW || TEST ? '<div class="actions"><button class="secondary" id="again">Start another ' + (PREVIEW ? "preview" : "test run") + "</button></div>" : "") +
+        (PREVIEW || (TEST && !CLASS) ? '<div class="actions"><button class="secondary" id="again">Start another ' + (PREVIEW ? "preview" : "test run") + "</button></div>" : "") +
       "</div>"
     );
     var again = $("#again");
@@ -538,7 +625,7 @@
   if (PREVIEW || TEST) {
     var badge = document.getElementById("mode-badge");
     badge.hidden = false;
-    badge.textContent = PREVIEW ? "Preview — not saved" : "Test mode";
+    badge.textContent = PREVIEW ? "Preview — not saved" : CLASS ? "Class group" : "Test mode";
   }
   document.getElementById("brand").textContent = CFG.studyTitle;
   document.title = CFG.studyTitle;
