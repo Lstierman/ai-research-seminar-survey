@@ -19,35 +19,30 @@ The old front end gave up after 3 attempts within about 2.5 s. Then:
 The front end now retries for several minutes with back-off and keeps retrying automatically.
 The changes below make the backend safe for that.
 
-## 1. Ignore duplicates (`rid`)
+## 1. Save queue + duplicate protection → `backend/queue.gs`
 
-Every request now carries a stable `rid` (e.g. `topic:P-xxx:3`). If an attempt was saved but the
-reply was lost, the retry comes in with the same `rid`. Wrap the existing `doPost` handler:
+Add [`backend/queue.gs`](backend/queue.gs) to the Apps Script project (setup steps are at the top of
+the file). In short: rename the current `doPost(e)` in `Code.gs` to `handlePost_(body)`, run
+`installQueueTrigger()` once, and deploy a new version.
 
-```js
-function doPost(e) {
-  var body = JSON.parse(e.postData.contents);
-  var cache = CacheService.getScriptCache();
-  if (body.rid) {
-    var seen = cache.get("rid:" + body.rid);
-    if (seen) return ContentService.createTextOutput(seen).setMimeType(ContentService.MimeType.JSON);
-  }
-  var out = handlePost_(body);                 // ← rename the current doPost body to handlePost_(body)
-  var text = out.getContent();
-  if (body.rid && text.indexOf('"error"') < 0) cache.put("rid:" + body.rid, text, 21600); // 6 h
-  return out;
-}
-```
+* `topic` and `finish` are stored in a queue (Script Properties) and acknowledged at once, without
+  waiting for the Sheet lock. A trigger writes the queue to the Sheet every minute, oldest first, using
+  the existing handler code. The Sheet and the dashboard can therefore be up to ~1 minute behind.
+* `start` still runs directly, because it has to return the assigned condition.
+* Every request carries a stable `rid`. A retry of something already handled gets the same answer and
+  is not saved twice, and a retry that arrives while the item is still waiting just overwrites it.
+* Items the Sheet code refuses (e.g. *Unknown participant*) are kept as `dead:` properties instead of
+  being lost. `queueStatus()` shows what is waiting and what was refused.
+* Limits: Script Properties hold 500 kB in total (about 80 participants' worth of unsaved answers,
+  emptied every minute) and 9 kB per item (larger items are saved directly, as before).
 
-For `topic`, also skip appending if rows for the same `participant_id` + `position` already exist.
-
-## 2. Hold the lock shorter
+## 2. Hold the lock shorter (still useful for `start` and the queue drain)
 
 * Read what you need (participant lookup, condition counts) **before** `lock.waitLock(...)`.
-  Only the write (`appendRow` / `setValues`) and, for `start`, the condition pick need the lock.
+  Only the write and, for `start`, the condition pick need the lock.
 * Prefer one `sheet.getRange(...).setValues(rows)` over 3 × `appendRow` for a topic.
 * When the lock can't be taken, return `{"error":"busy","status":503}` (not 400/403), so the
-  survey keeps retrying.
+  survey (and the queue) keeps retrying.
 
 ## 3. Class group (`/class/`)
 
